@@ -1,0 +1,55 @@
+import SynPSG.System
+import SynPSG.System.IO
+import SynPSG.System.Net
+import SynPSG.System.Net.Ftp
+import SynPSG.System.Net.Sockets
+import SynPSG.System.Net.Mime
+
+main
+record
+    myFTP   ,@synpsg.system.net.ftp.FtpClient
+endrecord
+
+.DEFINE D_FTP_SERVER	"ftp.freebsd.com"
+.DEFINE D_CONNECTMODE	FtpConnectMode.Passive
+.DEFINE D_LOGGING		true
+.DEFINE D_LOGFILE		"ftp.log"
+.DEFINE D_USE_CREDENTIALS	0
+.DEFINE D_USERNAME		"anonymous"
+.DEFINE D_PASSWORD		"mattl@synergex.com"
+
+.DEFINE D_LOCALDIR		""
+.DEFINE D_REMOTEDIR		"/pub/FreeBSD/"
+.DEFINE D_GETFILE		"README.TXT"
+.DEFINE D_SAVEFILE		"freebsd_save.txt"
+.DEFINE D_TXFR_MODE		FtpTransferType.Ascii
+
+proc
+    open(1,i,"TT:")
+    myFtp = new ftpclient( D_FTP_SERVER, 21, D_CONNECTMODE)
+	myFtp.LoggingEnabled = D_LOGGING
+	myFtp.LogFile = D_LOGFILE
+
+	writes(1,'...Attempting to connect...')
+
+	if D_USE_CREDENTIALS then
+		myFtp.Connect(D_USERNAME,D_PASSWORD)
+	else
+		myFtp.Connect()
+
+	if !(myFTP.IsConnected) then
+	begin
+		writes(1,'...Connection failed!...')
+	end
+	else
+	begin
+		writes(1,'...Connection successful...')
+		myFtp.LocalDirectory = D_LOCALDIR
+		myFtp.ChangeDirectory(D_REMOTEDIR)
+		myFtp.GetFile(D_GETFILE, D_SAVEFILE, D_TXFR_MODE)
+		writes(1,'...' + myFtp.LastServerResponse + '...')
+		myFtp.Disconnect()
+	end
+
+endmain
+

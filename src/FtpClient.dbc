@@ -1,0 +1,788 @@
+;;**********************************************************************
+;;
+;; Title:       FtpClient.dbc
+;;
+;; Type:        Class 
+;;
+;; Author:      Tod Phillips, Synergex Professional Services Group
+;;
+;; WARNING:     Neither Synergex nor the author accept any responsibility
+;;              for any losses or damages of any nature which may arise
+;;              from the use of this Code.  This header information must
+;;              remain unaltered in the Code at all times.  Possession
+;;              of this Code, or any modified version or part of this Code,
+;;              indicates your acceptance of these terms.
+;;
+;;***********************************************************************************
+import SynPSG.System
+import SynPSG.System.IO
+import SynPSG.System.Net
+import SynPSG.System.Net.Sockets
+import SynPSG.System.Net.Mime
+import System.collections
+
+.define CRLF    %char(13)+%char(10)
+.define CR      %char(13)
+.define LF      %char(10)
+
+.include "DBLDIR:synsock.def"
+
+namespace SynPSG.System.Net.Ftp
+    public enum FtpConnectMode
+        Active
+        Passive
+    endenum
+
+    public enum FtpTransferType
+        Ascii
+        Binary
+    endenum
+
+    public class FtpClient
+        public ConnectMode      ,FtpConnectMode
+        public Host             ,string
+        public LogFile          ,string
+        public Port             ,integer
+        public Pwd              ,string
+        public User             ,string
+        public TransferType     ,FtpTransferType
+        public RemoteDirectory  ,string
+        public RemoteDirListing ,@ArrayList
+        private mByte           ,byte
+        private mChLog          ,integer
+        private mCtrlContinues  ,boolean
+        private mCtrlStream     ,@NetworkStream
+        private mDataBlock      ,a32768
+        private mDataClient     ,@TcpClient
+        private mDataStream     ,@NetworkStream
+        private mDirSeparator   ,a1
+        private mErrMsg         ,string
+        private mLocalDirectory ,string
+        private mLoggingEnabled ,boolean
+        private mTcpClient      ,@TcpClient
+        private mIsConnected    ,boolean
+        private mRespCode       ,integer
+        private mFtpResponse    ,string
+
+        ;;********************************************************************
+
+        public method FtpClient
+            req in host             ,string
+            req in port             ,integer
+            req in connectMode     ,FtpConnectMode
+        proc
+            if host.Length > 0 then
+                this.Host = host
+            else
+                this.Host = "localhost"
+            if (port > 0) then
+                this.Port = port
+            else
+                this.Port = 21
+            this.ConnectMode = connectMode
+            User = "anonymous"
+            Pwd = ""
+            LogFile = "SynFtpClient.log"
+            TransferType = FtpTransferType.Ascii
+            mLocalDirectory = %syn_getdir
+            RemoteDirListing = new ArrayList()
+.ifdef D_GUI
+            mDirSeparator = "\"
+.endc
+.ifdef OS_UNIX
+            mDirSeparator = "/"
+.endc
+.ifdef OS_VMS
+            mDirSeparator = ""
+.endc
+
+        endmethod
+
+        ;;********************************************************************
+
+        public method FtpClient
+            req in host ,string
+            endparams
+            this(host, 21, FtpConnectMode.Passive)
+        proc
+        endmethod
+
+        ;;********************************************************************
+
+        public method FtpClient
+            endparams
+            this("localhost", 21, FtpConnectMode.Passive)
+        proc
+        endmethod
+
+        ;;********************************************************************
+
+        public method Connect   ,void
+            req in username ,string
+            req in password ,string
+            endparams
+        record
+            buff            ,string
+            tempbuf         ,a1024
+        endrecord
+        proc
+            User = username
+            Pwd = password
+
+            mTcpClient = new TcpClient(Host, Port)
+            mCtrlStream = mTcpClient.GetStream()
+
+            ;;Get initial response from the server. Set the timeout to 20 seconds
+            mCtrlStream.ReadTimeout = 20000
+
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            if (mRespCode == 220)
+            begin
+                sendCommand("USER " + User)
+                do
+                    getResponse(mCtrlStream, mRespCode)
+                until !(mCtrlContinues)
+                if (mRespCode == 331)
+                begin
+                    sendCommand("PASS " + Pwd)
+                    do
+                        getResponse(mCtrlStream, mRespCode)
+                    until !(mCtrlContinues)
+                end
+                if (mRespCode!=230)
+                    throw new applicationException("Login error: "+mFtpResponse)
+                GetRemoteDirectory()
+                if (mRespCode<300)
+                    GetDirectoryListing()
+			end
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        public method Connect   ,void
+            req in username ,string
+            endparams
+        proc
+            Connect(username, Pwd)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        public method Connect   ,void
+            endparams
+        proc
+            Connect(User, Pwd)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        public method Disconnect    ,void
+            endparams
+        proc
+            sendCommand("QUIT")
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues || mCtrlStream.DataAvailable)
+            mCtrlStream.Close()
+			mIsConnected = false
+        endmethod
+
+        ;;********************************************************************
+
+        public method ChangeDirectory   ,void
+            req in dirPath  ,string
+            endparams
+        proc
+            sendCommand("CWD "+dirPath)
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            if (mRespCode<300)
+            begin
+                RemoteDirListing.Clear()
+                GetRemoteDirectory()
+                if (mRespCode<300)
+                    GetDirectoryListing()
+            end
+
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        public method DeleteFile    ,void
+            req in fileSpec ,string
+            endparams
+        proc
+            sendCommand("DELE "+fileSpec)
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        public method GetDirectoryListing   ,void
+            req in fileSpec ,string
+            endparams
+        proc
+            establishDataPort()
+            sendCommand("TYPE A")
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            sendCommand(%atrim("LIST "+fileSpec))
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            if (mRespCode<300)
+            begin
+                RemoteDirListing.Clear()
+                do
+                    begin
+                    getResponse(mDataStream)
+                    RemoteDirListing.Add(mFtpResponse)
+                    end
+				until !(mDataStream.DataAvailable)
+				;; close down the data connection to signify receipt of listing
+				closeDataPort()
+                do
+                    getResponse(mCtrlStream, mRespCode)
+                until !(mCtrlContinues || mCtrlStream.DataAvailable)
+            end
+            mreturn
+        endmethod
+        ;;********************************************************************
+        public method GetDirectoryListing   ,void
+            endparams
+        proc
+            GetDirectoryListing("")
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        public method GetFile   ,void
+            req in remoteFileName ,string
+            req in localFileName  ,string
+            req in transferType ,FtpTransferType
+            endparams
+            stack record
+                newFile     ,@FileStream
+                byteCount   ,integer
+            endrecord
+        proc
+            using transferType select
+            (FtpTransferType.Ascii),
+                sendCommand("TYPE A")
+            (FtpTransferType.Binary),
+                sendCommand("TYPE I")
+            endusing
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            establishDataPort()
+            sendCommand("RETR "+remoteFileName)
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            if (mRespCode<300) then
+            begin
+                newFile = new FileStream(mLocalDirectory + mDirSeparator + localFileName, FileMode.Create)
+                while (byteCount = mDataStream.Read(mDataBlock, 0, ^size(mDataBlock)))
+                    newFile.Write(mDataBlock(1:byteCount), 0, byteCount)
+                newFile.Close()
+				closeDataPort()
+				do
+					getResponse(mCtrlStream, mRespCode)
+				until (!mCtrlContinues || !mCtrlStream.DataAvailable)
+			end
+			else
+				closeDataPort()
+            mreturn
+        endmethod
+        ;;********************************************************************
+        public method GetFile  ,void
+            req in fileName ,string
+            req in transferType ,FtpTransferType
+            endparams
+        proc
+            GetFile(fileName, fileName, transferType)
+            mreturn
+        endmethod
+        ;;********************************************************************
+        public method GetFile  ,void
+            req in fileName ,string
+            endparams
+        proc
+            GetFile(fileName, fileName, this.TransferType)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        ;;Overloaded. Uploads a local file to the current working directory.
+        ;; localFileName: the file to be uploaded from the current local directory
+        ;; remoteFileName: the name under which the file will be saved on the server
+        ;; transferType: the FTP transfer type that should be used for the upload
+        public method PutFile   ,void
+            req in localFileName    ,string
+            req in remoteFileName   ,string
+            req in transferType     ,FtpTransferType
+            endparams
+            stack record
+                sendFile        ,@FileStream
+                byteCount       ,integer
+                separator       ,a1
+            endrecord
+        proc
+            using transferType select
+            (FtpTransferType.Ascii),
+                sendCommand("TYPE A")
+            (FtpTransferType.Binary),
+                sendCommand("TYPE I")
+            endusing
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            establishDataPort()
+            sendCommand("STOR "+remoteFileName)
+            getResponse(mCtrlStream, mRespCode)
+            sendFile = new FileStream(mLocalDirectory + mDirSeparator + localFileName, FileMode.Open)
+            while (byteCount = sendFile.Read(mDataBlock, 0, ^size(mDataBlock)))
+                mDataStream.Write(mDataBlock, 0, byteCount)
+            sendFile.Close()
+            ;; close down the data connection to signify EndOfFile
+            using ConnectMode select
+            (FtpConnectMode.Active),
+                mDataStream.Close()
+            (FtpConnectMode.Passive),
+            begin
+                mDataStream.Close()
+                mDataClient.Close()
+            end
+            endusing
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues || mCtrlStream.DataAvailable)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        ;;Overloaded. Upload a local file to the current working directory.
+        ;; remoteFileName: the name under which the file will be saved on the server
+        ;; transferType: the FTP transfer type that should be used for the upload
+        public method PutFile   ,void
+            req in fileName     ,string
+            req in transferType ,FtpTransferType
+            endparams
+        proc
+            PutFile(fileName, fileName, transferType)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        ;;Overloaded. Uploads a local file to the current working directory.
+        ;; localFileName: the file to be uploaded from the current local directory
+        ;; remoteFileName: the name under which the file will be saved on the server
+        public method PutFile   ,void
+            req in fileName         ,string
+            req in remoteFileName   ,string
+            endparams
+        proc
+            PutFile(fileName, remoteFileName, this.TransferType)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        ;;Overloaded. Upload a local file to the current working directory
+        ;; remoteFileName: the name under which the file will be saved on the server
+        public method PutFile   ,void
+            req in fileName     ,string
+            endparams
+        proc
+            PutFile(fileName, fileName, this.TransferType)
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        ;;Rename a remote file
+        ;; fileName: the name of the file to be renamed
+        ;; renameTo: the new name of the file
+        public method RenameFile    ,void
+            req in fileName     ,string
+            req in renameTo     ,string
+            endparams
+        proc
+            sendCommand("RNFR " + fileName)
+            getResponse(mCtrlStream, mRespCode)
+            if (mRespCode<400)
+                sendCommand("RNTO " + renameTo)
+            getResponse(mCtrlStream, mRespCode)
+        endmethod
+
+        ;;********************************************************************
+
+        private method establishDataPort  ,void
+            endparams
+            stack record
+                count           ,integer
+                tmpAddress      ,a15
+                tmpPort         ,a7
+                tmpCmd          ,string
+                secondOrderPort ,integer
+                firstOrderPort  ,integer
+                peerSocket      ,integer
+                parsedAddress   ,[#]string
+                serverAddress   ,string
+                serverPort      ,integer
+                addrBegin       ,integer
+                addrEnd         ,integer
+                tmpBuf          ,a1024
+            endrecord
+        proc
+            using ConnectMode select
+            (FtpConnectMode.Active),
+            begin
+                mDataStream = new NetworkStream(new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+                ;;Set the timeout to 5 seconds
+                mDataStream.ReadTimeout = 5000
+                mDataStream.Socket.Bind(new IPEndPoint(mTcpClient.Client.LocalEndPoint.Address,0))
+				tmpAddress = mDataStream.Socket.LocalEndPoint.ToString()
+				if (count = instr(2,tmpAddress,':'))
+					tmpAddress = tmpAddress(1:count-1)
+                secondOrderPort = (mDataStream.Socket.LocalEndPoint.Port / 256)
+                firstOrderPort = mDataStream.Socket.LocalEndPoint.Port - (secondOrderPort * 256)
+                tmpPort = %string(secondOrderPort)+","+%string(firstOrderPort)
+                tmpCmd = "PORT "+StringUtil.Replace(%atrim(tmpAddress)+","+%atrim(tmpPort),".",",")
+                sendCommand(tmpCmd)
+                do
+                    getResponse(mCtrlStream, mRespCode)
+                until !(mCtrlContinues)
+                if (mRespCode < 300) then
+                begin
+                    mDataStream.Socket.Listen()
+                    if (%ss_accept(mDataStream.Socket.Handle, peerSocket)) then
+                        throw new applicationException("Error: Server failed to establish data connection within allotted time.")
+                    else
+                        mDataStream.Socket.Handle = peerSocket
+                    if (mLoggingEnabled)
+                        writeLog("Data connection established.")
+                end
+                else
+                    throw new applicationException("Data connection failed with error " + %string(mRespCode))
+            end
+            (FtpConnectMode.Passive),
+            begin
+                sendCommand("PASV")
+                do
+                    getResponse(mCtrlStream, mRespCode)
+                until !(mCtrlContinues)
+                if (mRespCode!=227)
+                    throw new applicationException("Passive mode request failed.")
+
+                ;; Get the address and port number passed back by the FTP server. The format is
+                ;; xxx,xxx,xxx,xxx,xxx,xxx
+                tmpBuf = mFtpResponse
+                for addrBegin from 5 thru mFtpResponse.Length
+                    if (tmpBuf(addrBegin:1)>="0" && tmpBuf(addrBegin:1)<="9")
+                        exitloop
+                for addrEnd from (addrBegin+1) thru mFtpResponse.Length
+                    if (tmpBuf(addrEnd:1)<"0" || tmpBuf(addrEnd:1)>"9")
+                        if (tmpBuf(addrEnd:1)!=",")
+                            exitloop
+                if (addrEnd>addrBegin+9) then
+                begin
+                    if (addrEnd>mFtpResponse.Length)
+                        addrEnd = mFtpResponse.Length
+                    tmpBuf = tmpBuf(addrBegin,addrEnd-1)
+                    parsedAddress = StringUtil.Split(tmpBuf, ",")
+                    if (parsedAddress.Length!=6)
+                        exit
+                    serverAddress = parsedAddress[1]
+                    for count from 2 thru 4
+                        begin
+                        serverAddress = String.Concat(serverAddress,"."+parsedAddress[count])
+                        end
+                    serverPort = (%integer(parsedAddress[5])*256) + %integer(parsedAddress[6])
+                end
+                else
+                    throw new applicationException("Invalid address returned in PASV request.")
+
+                ;; Now that we've got the Address information, connect to the server on the data channel
+                mDataClient = new TcpClient(serverAddress, serverPort)
+                mDataStream = mDataClient.GetStream()
+                if (mLoggingEnabled)
+                    writeLog("Data connection established.")
+            end
+            endusing
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+		
+		private method closeDataPort	,void
+			endparams
+		proc
+			if (mDataStream != ^null)
+				using ConnectMode select
+				(FtpConnectMode.Active),
+					mDataStream.Close()
+				(FtpConnectMode.Passive),
+				begin
+					mDataStream.Close()
+					mDataClient.Close()
+				end
+				endusing
+			mreturn
+		endmethod
+
+        ;;********************************************************************
+
+        private method sendCommand  ,void
+            req in Command  ,string
+            endparams
+        proc
+            if (Command.Length)
+            begin
+                if (mLoggingEnabled)
+                    writeLog(Command)
+                mCtrlStream.Write(Command + CRLF, 0, Command.Length + 2)
+            end
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        private method getResponse, void
+            req in responseStream       ,@NetworkStream
+            endparams
+
+        stack record vars
+            lineBuf     ,a1024
+            tempBuf     ,string
+            byteCount   ,i4
+        endrecord
+
+        proc
+            init lineBuf,byteCount
+            tempBuf = ""
+
+            ;; Read one byte at a time from the stream, so that we can identify
+            ;; when a LineFeed has been passed
+            while ((mByte=responseStream.ReadByte())!=(-1) && %char(mByte)!=LF)
+                lineBuf(byteCount+=1:1)=%char(mByte)
+
+            ;; Remove trailing CR
+            if (byteCount>1) then
+                if (linebuf(byteCount:1)==CR) then
+                    mFtpResponse = linebuf(1:byteCount-1)
+                else
+                    mFtpResponse = linebuf(1:byteCount)
+            else
+                mFtpResponse = ""
+
+            if mLoggingEnabled
+            begin
+                writeLog(mFtpResponse)
+            end
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        private method getResponse  ,void
+            req in responseStream       ,@NetworkStream
+            req out responseCode        ,integer
+            endparams
+        stack record vars
+            lineBuf     ,a1024
+        endrecord
+        proc
+            getResponse(responseStream)
+            if (mFtpResponse.Length > 0) then
+                try
+                begin
+                    lineBuf = mFtpResponse
+                    ResponseCode = %integer(lineBuf(1:3))
+                end
+                catch (ex)
+                    ResponseCode = 999
+                endtry
+            else
+                ResponseCode = 999
+
+            if (mFtpResponse.Length>3 && lineBuf(4:1)=="-" && ResponseCode!=999) then
+                mCtrlContinues = true
+            else
+                mCtrlContinues = false
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        ;; Get the remote working directory
+        private method GetRemoteDirectory   ,void
+            endparams
+        proc
+            ;; Get the remote working directory
+            sendCommand("PWD")
+            do
+                getResponse(mCtrlStream, mRespCode)
+            until !(mCtrlContinues)
+            if (mRespCode == 257) then
+            begin
+                data dirBegins  ,integer
+                data dirEnds    ,integer
+                if (dirBegins = %instr(4,mFtpResponse,'"'))
+                    if ((dirEnds = %instr(dirBegins+1,mFtpResponse,'"'))>dirBegins+1)
+                        RemoteDirectory = mFtpResponse(dirBegins+1:dirEnds-dirBegins+1)
+            end
+            else
+                RemoteDirectory = ""
+            mreturn
+        endmethod
+
+        ;;********************************************************************
+
+        private method writeLog ,void
+            logLine     ,string
+            endparams
+        proc
+            if (!mChLog)
+                if (LogFile == "TT:") then
+                    open(mChLog = %syn_freechn, O, LogFile)
+                else
+                    open(mChLog = %syn_freechn, O:S, LogFile)
+            writes(mChLog, logLine)
+        endmethod
+
+       ;;********************************************************************
+
+        public property IsConnected ,boolean
+            method get
+            proc
+                mreturn mTcpClient.Connected
+            endmethod
+        endproperty
+
+        ;;********************************************************************
+
+        public property LoggingEnabled  ,boolean
+            method get
+            proc
+                mreturn mLoggingEnabled
+            endmethod
+            method set
+            proc
+                if !(mLoggingEnabled = value)
+                    if (mChLog && chopen(mChLog))
+                    begin
+                        close mChLog
+                        init mChLog
+                    end
+            endmethod
+        endproperty
+
+        ;;********************************************************************
+
+        public property LocalDirectory  ,string
+            method get
+            proc
+                mreturn mLocalDirectory
+            endmethod
+            method set
+                record
+                    sts ,integer
+                endrecord
+            proc
+                xcall syn_setdir(value)
+                mLocalDirectory = %syn_getdir
+            endmethod
+        endproperty
+
+        ;;********************************************************************
+		
+		public property LastServerResponse	,string
+			method get
+			proc
+				mreturn mFtpResponse
+			endmethod
+		endproperty
+		
+        ;;********************************************************************
+
+        private method checkResponseCode,   boolean
+            req in Code1    ,integer
+            endparams
+        proc
+            mErrMsg = ""
+
+            using mRespCode select
+            (<400),
+                nop
+            (421),
+                mErrMsg = "Service not available, closing control connection."
+            (425),
+                mErrMsg = "Can't open data connection"
+            (426),
+                mErrMsg = "Connection closed; transfer aborted."
+            (450),
+                mErrMsg = "Requested file action not taken."
+            (451),
+                mErrMsg = "Requested action aborted. Local error in processing."
+            (452),
+                mErrMsg = "Requested action not taken. Insufficient storage space in system or file unavailable."
+            (500),
+                mErrMsg = "Syntax error, command unrecognized."
+            (501),
+                mErrMsg = "Syntax error in parameters or arguments."
+            (502),
+                mErrMsg = "Command not implemented."
+            (503),
+                mErrMsg = "Bad sequence of commands."
+            (504),
+                mErrMsg = "Command not implemented for that parameter."
+            (530),
+                mErrMsg = "Not logged in."
+            (532),
+                mErrMsg = "Need account for storing files."
+            (550),
+                mErrMsg = "Requested action not taken. File unavailable."
+            (551),
+                mErrMsg = "Requested action aborted. Page type unknown."
+            (552),
+                mErrMsg = "Requested file action aborted. Exceeded storage allocation."
+            (553),
+                mErrMsg = "Requested action not taken. File name not allowed."
+            (),
+                mErrMsg = "Unknown FTP server response code."
+            endusing
+
+            if (^passed(Code1) && mRespCode!=Code1)
+                if !(mErrMsg.Length)
+                begin
+                    mErrMsg = "Invalid or unexpected SMTP response."
+                    mreturn true
+                end
+
+            if (mErrMsg.Length && mRespCode >=400)
+            begin
+                if (mRespCode >= 500)
+                    mCtrlStream.Close()
+                mreturn true
+            end
+            mreturn false
+        endmethod
+    endclass
+endnamespace
